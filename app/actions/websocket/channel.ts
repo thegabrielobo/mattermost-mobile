@@ -23,10 +23,20 @@ import {canViewArchivedChannels, getCurrentChannelId, getCurrentTeamId, getCurre
 import {getCurrentUser, getTeammateNameDisplay, getUserById} from '@queries/servers/user';
 import EphemeralStore from '@store/ephemeral_store';
 import MyChannelModel from '@typings/database/models/servers/my_channel';
+import {getFullErrorMessage} from '@utils/errors';
 import {logDebug} from '@utils/log';
 import {haveSameRoles} from '@utils/user';
 
 import type {Model} from '@nozbe/watermelondb';
+
+type ChannelUnarchiveEvent = {
+    data: {
+        channel_id: string;
+        team_id?: string;
+    };
+};
+
+const pendingChannelUnarchives = new Map<string, Promise<void>>();
 
 // Received when current user created a channel in a different client
 export async function handleChannelCreatedEvent(serverUrl: string, msg: any) {
@@ -68,15 +78,59 @@ export async function handleChannelCreatedEvent(serverUrl: string, msg: any) {
     }
 }
 
-export async function handleChannelUnarchiveEvent(serverUrl: string, msg: any) {
+export async function handleChannelUnarchiveEvent(serverUrl: string, msg: ChannelUnarchiveEvent) {
+    const key = JSON.stringify([serverUrl, msg.data.channel_id]);
+    const pending = pendingChannelUnarchives.get(key);
+    if (pending) {
+        logDebug('handleChannelUnarchiveEvent: recovery already in progress', msg.data.channel_id);
+        await pending;
+        return;
+    }
+
+    const operation = recoverUnarchivedChannel(serverUrl, msg);
+    pendingChannelUnarchives.set(key, operation);
     try {
-        if (EphemeralStore.isArchivingChannel(msg.data.channel_id)) {
+        await operation;
+    } finally {
+        pendingChannelUnarchives.delete(key);
+    }
+}
+
+async function recoverUnarchivedChannel(serverUrl: string, msg: ChannelUnarchiveEvent) {
+    try {
+        const channelId = msg.data.channel_id;
+        if (EphemeralStore.isArchivingChannel(channelId)) {
+            logDebug('handleChannelUnarchiveEvent: channel is being archived locally', channelId);
             return;
         }
 
-        await setChannelDeleteAt(serverUrl, msg.data.channel_id, 0);
-    } catch {
-        // do nothing
+        const {database, operator} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
+        const channel = await getChannelById(database, channelId);
+        if (channel) {
+            await setChannelDeleteAt(serverUrl, channelId, 0);
+            return;
+        }
+
+        // The event may not include a team ID. The fetched channel supplies it.
+        const {channels, memberships} = await fetchMyChannel(serverUrl, msg.data.team_id ?? '', channelId, true);
+        if (!channels?.length || !memberships?.length) {
+            logDebug('handleChannelUnarchiveEvent: channel or membership could not be fetched', channelId);
+            return;
+        }
+
+        const restoredChannel = channels[0];
+        const prepare = await prepareMyChannelsForTeam(operator, restoredChannel.team_id, channels, memberships);
+        const models = (await Promise.all(prepare)).flat();
+        const category = await addChannelToDefaultCategory(serverUrl, restoredChannel, true);
+        if (category.error) {
+            logDebug('handleChannelUnarchiveEvent: could not prepare category', getFullErrorMessage(category.error));
+            return;
+        }
+        models.push(...(category.models ?? []));
+        await operator.batchRecords(models, 'handleChannelUnarchiveEvent');
+        await addChannelToManagedCategoryIfNeeded(serverUrl, restoredChannel);
+    } catch (error) {
+        logDebug('handleChannelUnarchiveEvent', getFullErrorMessage(error));
     }
 }
 

@@ -1,0 +1,80 @@
+name: PSWE07 mobile channel unarchive
+
+on:
+  push:
+    branches:
+      - GH-26673-unarchived-channel-list
+  pull_request:
+    paths:
+      - app/actions/websocket/channel.ts
+      - app/actions/websocket/channel.test.ts
+      - app/actions/websocket/channel_unarchive.test.ts
+      - app/actions/websocket/event.test.ts
+      - .github/workflows/pswe07-unarchive.yml
+      - package.json
+      - package-lock.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pswe07-unarchive-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Lint types and channel regression tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set up repository Node version
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - name: Install JavaScript dependencies without native builds
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Apply repository patches and generate assets
+        run: |
+          node node_modules/patch-package/index.js
+          node scripts/generate-assets.js
+          node scripts/generate-compass-glyph-map.mjs
+      - name: Lint changed channel files
+        run: >-
+          node node_modules/eslint/bin/eslint.js --quiet
+          app/actions/websocket/channel.ts
+          app/actions/websocket/channel.test.ts
+          app/actions/websocket/channel_unarchive.test.ts
+      - name: Check project TypeScript types
+        id: types
+        continue-on-error: true
+        run: npm run tsc
+      - name: Run channel regression tests and collect coverage
+        id: tests
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p test-results
+          node node_modules/jest/bin/jest.js --ci --runInBand \
+            app/actions/websocket/channel.test.ts \
+            app/actions/websocket/channel_unarchive.test.ts \
+            app/actions/websocket/event.test.ts \
+            --coverage --collectCoverageFrom=app/actions/websocket/channel.ts \
+            --json --outputFile=test-results/channel-tests.json
+      - name: Upload test and coverage evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pswe07-mobile-channel-evidence
+          path: |
+            test-results/
+            coverage/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Enforce TypeScript result
+        if: ${{ !cancelled() && steps.types.outcome == 'failure' }}
+        run: |
+          echo 'TypeScript failed; inspect the type-check step. This workflow does not waive type errors.'
+          exit 1
