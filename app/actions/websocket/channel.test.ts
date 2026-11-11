@@ -169,6 +169,7 @@ describe('WebSocket Channel Actions', () => {
     describe('handleChannelUnarchiveEvent', () => {
         it('should handle channel unarchive event', async () => {
             (EphemeralStore.isArchivingChannel as jest.Mock).mockReturnValue(false);
+            mockedGetChannelById.mockResolvedValue(channelModel);
 
             await handleChannelUnarchiveEvent(serverUrl, msg);
 
